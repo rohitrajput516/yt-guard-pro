@@ -36,6 +36,7 @@ jobs:
           curl -sL "$MAVEN/org/antlr/antlr-runtime/3.5.2/antlr-runtime-3.5.2.jar" -o smali_libs/antlr-runtime.jar
           curl -sL "$MAVEN/org/antlr/stringtemplate/3.2.1/stringtemplate-3.2.1.jar" -o smali_libs/stringtemplate.jar
           curl -sL "$MAVEN/antlr/antlr/2.7.7/antlr-2.7.7.jar" -o smali_libs/antlr.jar
+          curl -sL "https://github.com/REAndroid/APKEditor/releases/download/V1.3.9/APKEditor-1.3.9.jar" -o APKEditor.jar
 
           mkdir -p build_dex/classes next_dex_smali
           javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java
@@ -48,7 +49,45 @@ jobs:
             echo "ERROR: No YouTube .apk found in Releases! Please attach your YouTube APK in GitHub Releases."
             exit 1
           fi
-          curl -sL "$RELEASE_URL" -o base.apk
+          curl -sL "$RELEASE_URL" -o raw_base.apk
+
+          echo "Renaming package & provider authorities to avoid system YouTube conflict..."
+          java -Xmx3g -jar APKEditor.jar d -t xml -i raw_base.apk -o apk_decoded
+
+          python3 - << 'EOF'
+          import re
+
+          manifest_path = "apk_decoded/AndroidManifest.xml"
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              xml_text = f.read()
+
+          old_pkg = "com.google.android.youtube"
+          new_pkg = "com.rohitx.android.youtube"
+
+          xml_text = re.sub(r'android:name="\.([^"]+)"', f'android:name="{old_pkg}.\\1"', xml_text)
+          xml_text = re.sub(r'package="com\.google\.android\.youtube"', f'package="{new_pkg}"', xml_text)
+
+          counter = [0]
+          def fix_authorities(m):
+              val = m.group(1)
+              if old_pkg in val:
+                  return f'android:authorities="{val.replace(old_pkg, new_pkg)}"'
+              elif val.startswith("@"):
+                  counter[0] += 1
+                  return f'android:authorities="{new_pkg}.provider.p{counter[0]}"'
+              else:
+                  return f'android:authorities="{new_pkg}.{val}"'
+
+          xml_text = re.sub(r'android:authorities="([^"]+)"', fix_authorities, xml_text)
+          xml_text = re.sub(r'(<permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+          xml_text = re.sub(r'(<uses-permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(xml_text)
+          EOF
+
+          java -Xmx3g -jar APKEditor.jar b -i apk_decoded -o base.apk
+          rm -rf apk_decoded raw_base.apk
 
           mkdir -p apk_work
           cp base.apk apk_work/working.apk
@@ -75,12 +114,13 @@ jobs:
           done
 
           java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a next_dex_smali -o "apk_work/$NEXT_DEX"
+          zip -q -d apk_work/working.apk "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/*.EC" "META-INF/MANIFEST.MF" || true
           (cd apk_work && zip -q -0 -u working.apk classes*.dex)
 
           "$BUILD_TOOLS/zipalign" -p -f 4 apk_work/working.apk YouTube-YTGuard-Integrated.apk
           rm -f release.keystore
           keytool -genkey -v -keystore release.keystore -alias ytguard -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=Rohit, OU=Dev, O=YTGuard, L=Dholpur, S=RJ, C=IN"
-          "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-pass pass:123456 --key-pass pass:123456 YouTube-YTGuard-Integrated.apk
+          "$BUILD_TOOLS/apksigner" sign --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --ks release.keystore --ks-pass pass:123456 --key-pass pass:123456 YouTube-YTGuard-Integrated.apk
 
       - name: Upload Integrated YouTube APK
         uses: actions/upload-artifact@v4
