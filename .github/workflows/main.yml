@@ -100,27 +100,59 @@ jobs:
           DEX_COUNT=$(ls apk_work/classes*.dex | wc -l)
           NEXT_DEX="classes$((DEX_COUNT + 1)).dex"
 
+          # ---- Fix for the Primes crash (YouTube code only allows Google package names) ----
+          cat > patch_primes.py << 'PYEOF'
+          import sys, re
+          path = sys.argv[1]
+          msg = "Primes did not observe lifecycle events in the expected order"
+          t = open(path, encoding="utf-8").read()
+          i = t.find(msg)
+          if i < 0:
+              print("PRIMES PATCH: message not found in", path)
+              sys.exit(1)
+          m = re.compile(r"^[ \t]*if-eqz [^\n]*\n", re.M).search(t, i)
+          if not m or m.start() - i > 900:
+              print("PRIMES PATCH: if-eqz not found near message in", path)
+              sys.exit(1)
+          print("PRIMES PATCH: removing ->", m.group(0).strip(), "in", path)
+          t = t[:m.start()] + t[m.end():]
+          open(path, "w", encoding="utf-8").write(t)
+          PYEOF
+
           COUNT=0
-          if [ "${{ github.event.inputs.guard }}" != "false" ]; then
-          echo "Guard hook ON"
+          GUARD_ON="${{ github.event.inputs.guard }}"
+          echo "guard input = '$GUARD_ON' (anything except false = guard hook ON)"
           for DEX in $(ls apk_work/classes*.dex | sort -V); do
             SMALI_DIR="${DEX}_smali"
             java -Xmx2g -cp "smali_libs/*" org.jf.baksmali.Main d "$DEX" -o "$SMALI_DIR"
-            MATCHES=$(grep -rl "Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V" "$SMALI_DIR" || true)
-            if [ -n "$MATCHES" ]; then
-              for FILE in $MATCHES; do
-                sed -i 's|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
-                sed -i 's|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
-                COUNT=$((COUNT + 1))
-                mv "$FILE" "next_dex_smali/hooked_${COUNT}.smali"
+            CHANGED=0
+
+            PRIMES=$(grep -rl "Primes did not observe lifecycle events in the expected order" "$SMALI_DIR" || true)
+            if [ -n "$PRIMES" ]; then
+              for PF in $PRIMES; do
+                python3 patch_primes.py "$PF"
+                CHANGED=1
               done
+            fi
+
+            if [ "$GUARD_ON" != "false" ]; then
+              MATCHES=$(grep -rl "Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V" "$SMALI_DIR" || true)
+              if [ -n "$MATCHES" ]; then
+                for FILE in $MATCHES; do
+                  sed -i 's|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
+                  sed -i 's|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
+                  COUNT=$((COUNT + 1))
+                  mv "$FILE" "next_dex_smali/hooked_${COUNT}.smali"
+                done
+                CHANGED=1
+              fi
+            fi
+
+            if [ "$CHANGED" = "1" ]; then
               java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a "$SMALI_DIR" -o "$DEX"
             fi
             rm -rf "$SMALI_DIR"
           done
-          else
-          echo "Guard hook OFF (test build: only package rename)"
-          fi
 
           java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a next_dex_smali -o "apk_work/$NEXT_DEX"
           zip -q -d apk_work/working.apk "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/*.EC" "META-INF/MANIFEST.MF" || true
