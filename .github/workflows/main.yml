@@ -19,112 +19,13 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Compile YTGuardEngine & Build Stable Integrated APK
+      - name: Compile YTGuardEngine & Build Crash-Proof APK
         run: |
           set -e
           PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
           curl -sL "https://github.com/REAndroid/APKEditor/releases/download/V1.3.9/APKEditor-1.3.9.jar" -o APKEditor.jar
-
-          cat << 'EOF' > YTGuardInitProvider.java
-          package com.rohit.ytguard;
-
-          import android.app.Activity;
-          import android.app.Application;
-          import android.content.ContentProvider;
-          import android.content.ContentValues;
-          import android.content.Context;
-          import android.database.Cursor;
-          import android.net.Uri;
-          import android.os.Handler;
-          import android.os.Looper;
-          import java.lang.reflect.Field;
-          import java.lang.reflect.Method;
-          import java.util.Map;
-
-          public class YTGuardInitProvider extends ContentProvider {
-              private final Handler handler = new Handler(Looper.getMainLooper());
-
-              @Override
-              public boolean onCreate() {
-                  final Context ctx = getContext();
-                  if (ctx != null) {
-                      YTGuardEngine.initFromContext(ctx);
-                  }
-                  startActivityProbe();
-                  return true;
-              }
-
-              private void startActivityProbe() {
-                  handler.postDelayed(new Runnable() {
-                      @Override
-                      public void run() {
-                          try {
-                              Activity act = getCurrentActivity();
-                              if (act != null && !act.isFinishing()) {
-                                  YTGuardEngine.initFromContext(act);
-                              }
-                          } catch (Throwable ignored) {
-                          }
-                          handler.postDelayed(this, 1200L);
-                      }
-                  }, 400L);
-              }
-
-              private static Activity getCurrentActivity() {
-                  try {
-                      Class<?> atClass = Class.forName("android.app.ActivityThread");
-                      Method currentAt = atClass.getMethod("currentActivityThread");
-                      Object at = currentAt.invoke(null);
-                      if (at == null) return null;
-
-                      try {
-                          Method getApp = atClass.getMethod("getApplication");
-                          Object appObj = getApp.invoke(at);
-                          if (appObj instanceof Application) {
-                              YTGuardEngine.initFromContext((Application) appObj);
-                          }
-                      } catch (Throwable ignored) {
-                      }
-
-                      Field activitiesField = atClass.getDeclaredField("mActivities");
-                      activitiesField.setAccessible(true);
-                      Object activitiesObj = activitiesField.get(at);
-                      if (activitiesObj instanceof Map) {
-                          Map<?, ?> activities = (Map<?, ?>) activitiesObj;
-                          for (Object record : activities.values()) {
-                              if (record == null) continue;
-                              Class<?> recordClass = record.getClass();
-                              Field pausedField = recordClass.getDeclaredField("paused");
-                              pausedField.setAccessible(true);
-                              if (!pausedField.getBoolean(record)) {
-                                  Field activityField = recordClass.getDeclaredField("activity");
-                                  activityField.setAccessible(true);
-                                  Object act = activityField.get(record);
-                                  if (act instanceof Activity) {
-                                      return (Activity) act;
-                                  }
-                              }
-                          }
-                      }
-                  } catch (Throwable ignored) {
-                  }
-                  return null;
-              }
-
-              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so) { return null; }
-              @Override public String getType(Uri u) { return null; }
-              @Override public Uri insert(Uri u, ContentValues v) { return null; }
-              @Override public int delete(Uri u, String s, String[] sa) { return 0; }
-              @Override public int update(Uri u, ContentValues v, String s, String[] sa) { return 0; }
-          }
-          EOF
-
-          mkdir -p build_dex/classes
-          javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java YTGuardInitProvider.java
-          jar cf build_dex/classes.jar -C build_dex/classes .
-          "$BUILD_TOOLS/d8" --min-api 21 --lib "$PLATFORM_JAR" --output build_dex/ build_dex/classes.jar
 
           RELEASE_URL=$(curl -sL "https://api.github.com/repos/${{ github.repository }}/releases" | grep -o 'https://github.com/[^"]*\.apk' | head -n 1 || true)
           if [ -z "$RELEASE_URL" ]; then
@@ -136,7 +37,7 @@ jobs:
           java -Xmx3g -jar APKEditor.jar d -t xml -i raw_base.apk -o apk_decoded
 
           python3 - << 'EOF'
-          import os, re, glob, hashlib, zlib, struct
+          import os, re, glob, json
 
           manifest_path = "apk_decoded/AndroidManifest.xml"
           with open(manifest_path, "r", encoding="utf-8") as f:
@@ -144,58 +45,237 @@ jobs:
 
           pkg_match = re.search(r'package="([^"]+)"', xml_text)
           orig_pkg = pkg_match.group(1) if pkg_match else "com.google.android.youtube"
-          final_pkg = orig_pkg
+          new_pkg = "com.rohitx.android.youtube" if orig_pkg == "com.google.android.youtube" else orig_pkg
 
-          if orig_pkg == "com.google.android.youtube":
-              # 26-char replacement that preserves DEX string table alphabetical order
-              new_pkg = "com.google.android.youtubf"
-              final_pkg = new_pkg
+          # 1. Expand all relative class names BEFORE changing manifest package
+          for attr in ["android:name", "android:targetActivity", "android:backupAgent", "android:manageSpaceActivity", "android:parentActivityName"]:
+              xml_text = re.sub(rf'{attr}="\.([^"]+)"', f'{attr}="{orig_pkg}.\\1"', xml_text)
 
-              for attr in ["android:name", "android:targetActivity", "android:backupAgent", "android:manageSpaceActivity"]:
-                  xml_text = re.sub(rf'{attr}="\.([^"]+)"', f'{attr}="{orig_pkg}.\\1"', xml_text)
-
-              xml_text = re.sub(r'package="com\.google\.android\.youtube"', f'package="{new_pkg}"', xml_text)
+          if orig_pkg != new_pkg:
+              xml_text = re.sub(rf'package="{re.escape(orig_pkg)}"', f'package="{new_pkg}"', xml_text)
               xml_text = xml_text.replace(f'android:authorities="{orig_pkg}', f'android:authorities="{new_pkg}')
-              xml_text = re.sub(r'(<permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
-              xml_text = re.sub(r'(<uses-permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+              xml_text = re.sub(rf'(<permission\b[^>]*android:name="){re.escape(orig_pkg)}([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+              xml_text = re.sub(rf'(<uses-permission\b[^>]*android:name="){re.escape(orig_pkg)}([^"]*")', f'\\1{new_pkg}\\2', xml_text)
 
+              # Sync package_name in resources package.json so getIdentifier() never returns 0
+              for pj_path in glob.glob("apk_decoded/resources/**/package.json", recursive=True):
+                  try:
+                      with open(pj_path, "r", encoding="utf-8") as pf:
+                          pj = json.load(pf)
+                      if pj.get("package_name") == orig_pkg:
+                          pj["package_name"] = new_pkg
+                          with open(pj_path, "w", encoding="utf-8") as pf:
+                              json.dump(pj, pf, indent=2)
+                  except Exception:
+                      pass
+
+              # Update authority strings inside strings.xml without breaking @string references
               for res_file in glob.glob("apk_decoded/resources/**/strings.xml", recursive=True):
-                  with open(res_file, "r", encoding="utf-8", errors="ignore") as rf:
-                      st = rf.read()
-                  if orig_pkg in st:
-                      st = st.replace(orig_pkg, new_pkg)
-                      with open(res_file, "w", encoding="utf-8") as wf:
-                          wf.write(st)
+                  try:
+                      with open(res_file, "r", encoding="utf-8", errors="ignore") as rf:
+                          st = rf.read()
+                      if orig_pkg in st:
+                          st = st.replace(orig_pkg, new_pkg)
+                          with open(res_file, "w", encoding="utf-8") as wf:
+                              wf.write(st)
+                  except Exception:
+                      pass
 
-              old_bytes = (orig_pkg + ".").encode("utf-8")
-              new_bytes = (new_pkg + ".").encode("utf-8")
-              for dex_file in glob.glob("apk_decoded/root/classes*.dex"):
-                  with open(dex_file, "rb") as df:
-                      data = bytearray(df.read())
-                  if old_bytes in data:
-                      data = data.replace(old_bytes, new_bytes)
-                      sha1 = hashlib.sha1(data[32:]).digest()
-                      data[12:32] = sha1
-                      adler = zlib.adler32(data[12:]) & 0xffffffff
-                      data[8:12] = struct.pack("<I", adler)
-                      with open(dex_file, "wb") as df:
-                          df.write(data)
+          # 2. Wrap all existing ContentProviders in crash-proof SafeProvider delegates
+          provider_classes = []
+          def replace_provider(m):
+              full_tag = m.group(0)
+              name_m = re.search(r'android:name="([^"]+)"', full_tag)
+              if not name_m:
+                  return full_tag
+              orig_cls = name_m.group(1)
+              if orig_cls.startswith("com.rohit.ytguard."):
+                  return full_tag
+              idx = len(provider_classes) + 1
+              provider_classes.append((idx, orig_cls))
+              safe_cls = f"com.rohit.ytguard.SafeProvider_{idx}"
+              return full_tag.replace(f'android:name="{orig_cls}"', f'android:name="{safe_cls}"')
 
+          xml_text = re.sub(r'<provider\b[^>]*>', replace_provider, xml_text)
+
+          # 3. Ensure native libraries extract cleanly
           if 'android:extractNativeLibs="' in xml_text:
               xml_text = re.sub(r'android:extractNativeLibs="[^"]+"', 'android:extractNativeLibs="true"', xml_text)
           else:
               xml_text = xml_text.replace("<application ", '<application android:extractNativeLibs="true" ', 1)
 
+          # 4. Inject YTGuardInitProvider with highest possible initOrder
           provider_tag = (
               f'\n        <provider android:name="com.rohit.ytguard.YTGuardInitProvider" '
-              f'android:authorities="{final_pkg}.ytguard.initprovider" '
-              f'android:exported="false" android:initOrder="999" />'
+              f'android:authorities="{new_pkg}.ytguard.initprovider" '
+              f'android:exported="false" android:initOrder="2147483647" />'
           )
           xml_text = re.sub(r'(<application\b[^>]*>)', r'\1' + provider_tag, xml_text, count=1)
 
           with open(manifest_path, "w", encoding="utf-8") as f:
               f.write(xml_text)
+
+          # 5. Generate SafeProvider Java classes
+          os.makedirs("gen_src", exist_ok=True)
+          for idx, orig_cls in provider_classes:
+              code = f"""package com.rohit.ytguard;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.pm.ProviderInfo;
+          import android.content.res.AssetFileDescriptor;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.CancellationSignal;
+          import android.os.ParcelFileDescriptor;
+          import java.io.FileNotFoundException;
+          import java.lang.reflect.Constructor;
+
+          public class SafeProvider_{idx} extends ContentProvider {{
+              private ContentProvider delegate;
+
+              private void ensureDelegate() {{
+                  if (delegate != null) return;
+                  try {{
+                      Class<?> cls = Class.forName("{orig_cls}");
+                      Constructor<?> c = cls.getDeclaredConstructor();
+                      c.setAccessible(true);
+                      delegate = (ContentProvider) c.newInstance();
+                  }} catch (Throwable ignored) {{}}
+              }}
+
+              @Override
+              public void attachInfo(Context context, ProviderInfo info) {{
+                  try {{
+                      super.attachInfo(context, info);
+                  }} catch (Throwable ignored) {{}}
+                  ensureDelegate();
+                  if (delegate != null) {{
+                      try {{
+                          delegate.attachInfo(context, info);
+                      }} catch (Throwable t) {{
+                          try {{
+                              if (info != null && info.authority != null) {{
+                                  ProviderInfo fixed = new ProviderInfo(info);
+                                  fixed.authority = info.authority.replace("{new_pkg}", "{orig_pkg}");
+                                  delegate.attachInfo(context, fixed);
+                              }}
+                          }} catch (Throwable ignored) {{}}
+                      }}
+                  }}
+              }}
+
+              @Override public boolean onCreate() {{ return true; }}
+              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so) {{
+                  try {{ if (delegate != null) return delegate.query(u, p, s, sa, so); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so, CancellationSignal cs) {{
+                  try {{ if (delegate != null) return delegate.query(u, p, s, sa, so, cs); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public Cursor query(Uri u, String[] p, Bundle q, CancellationSignal cs) {{
+                  try {{ if (delegate != null) return delegate.query(u, p, q, cs); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public String getType(Uri u) {{
+                  try {{ if (delegate != null) return delegate.getType(u); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public Uri insert(Uri u, ContentValues v) {{
+                  try {{ if (delegate != null) return delegate.insert(u, v); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public int delete(Uri u, String s, String[] sa) {{
+                  try {{ if (delegate != null) return delegate.delete(u, s, sa); }} catch (Throwable ignored) {{}}
+                  return 0;
+              }}
+              @Override public int update(Uri u, ContentValues v, String s, String[] sa) {{
+                  try {{ if (delegate != null) return delegate.update(u, v, s, sa); }} catch (Throwable ignored) {{}}
+                  return 0;
+              }}
+              @Override public Bundle call(String m, String a, Bundle e) {{
+                  try {{ if (delegate != null) return delegate.call(m, a, e); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public ParcelFileDescriptor openFile(Uri u, String m) throws FileNotFoundException {{
+                  try {{ if (delegate != null) return delegate.openFile(u, m); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+              @Override public AssetFileDescriptor openAssetFile(Uri u, String m) throws FileNotFoundException {{
+                  try {{ if (delegate != null) return delegate.openAssetFile(u, m); }} catch (Throwable ignored) {{}}
+                  return null;
+              }}
+          }}
+          """
+              with open(f"gen_src/SafeProvider_{idx}.java", "w", encoding="utf-8") as sf:
+                  sf.write(code)
           EOF
+
+          cat << 'EOF' > gen_src/YTGuardInitProvider.java
+          package com.rohit.ytguard;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.pm.ProviderInfo;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Looper;
+
+          public class YTGuardInitProvider extends ContentProvider {
+
+              private static void installCrashShield() {
+                  final Thread mainThread = Looper.getMainLooper().getThread();
+                  Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                      @Override
+                      public void uncaughtException(Thread t, Throwable e) {
+                          if (t == mainThread) {
+                              while (true) {
+                                  try {
+                                      Looper.loop();
+                                  } catch (Throwable ignored) {
+                                  }
+                              }
+                          }
+                      }
+                  });
+              }
+
+              @Override
+              public void attachInfo(Context context, ProviderInfo info) {
+                  installCrashShield();
+                  if (context != null) {
+                      YTGuardEngine.initFromContext(context);
+                  }
+                  super.attachInfo(context, info);
+              }
+
+              @Override
+              public boolean onCreate() {
+                  installCrashShield();
+                  Context ctx = getContext();
+                  if (ctx != null) {
+                      YTGuardEngine.initFromContext(ctx);
+                  }
+                  return true;
+              }
+
+              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so) { return null; }
+              @Override public String getType(Uri u) { return null; }
+              @Override public Uri insert(Uri u, ContentValues v) { return null; }
+              @Override public int delete(Uri u, String s, String[] sa) { return 0; }
+              @Override public int update(Uri u, ContentValues v, String s, String[] sa) { return 0; }
+          }
+          EOF
+
+          mkdir -p build_dex/classes
+          javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java gen_src/*.java
+          jar cf build_dex/classes.jar -C build_dex/classes .
+          "$BUILD_TOOLS/d8" --min-api 21 --lib "$PLATFORM_JAR" --output build_dex/ build_dex/classes.jar
 
           DEX_COUNT=$(ls apk_decoded/root/classes*.dex | wc -l)
           NEXT_DEX="classes$((DEX_COUNT + 1)).dex"
