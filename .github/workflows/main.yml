@@ -25,14 +25,23 @@ jobs:
           PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
-          curl -sL https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar -o baksmali.jar
-          curl -sL https://repo1.maven.org/maven2/org/smali/smali/2.5.2/smali-2.5.2.jar -o smali.jar
+          mkdir -p smali_libs
+          MAVEN="https://repo1.maven.org/maven2"
+          curl -sL "$MAVEN/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar" -o smali_libs/baksmali.jar
+          curl -sL "$MAVEN/org/smali/smali/2.5.2/smali-2.5.2.jar" -o smali_libs/smali.jar
+          curl -sL "$MAVEN/org/smali/dexlib2/2.5.2/dexlib2-2.5.2.jar" -o smali_libs/dexlib2.jar
+          curl -sL "$MAVEN/org/smali/util/2.5.2/util-2.5.2.jar" -o smali_libs/util.jar
+          curl -sL "$MAVEN/com/beust/jcommander/1.78/jcommander-1.78.jar" -o smali_libs/jcommander.jar
+          curl -sL "$MAVEN/com/google/guava/guava/27.1-android/guava-27.1-android.jar" -o smali_libs/guava.jar
+          curl -sL "$MAVEN/org/antlr/antlr-runtime/3.5.2/antlr-runtime-3.5.2.jar" -o smali_libs/antlr-runtime.jar
+          curl -sL "$MAVEN/org/antlr/stringtemplate/3.2.1/stringtemplate-3.2.1.jar" -o smali_libs/stringtemplate.jar
+          curl -sL "$MAVEN/antlr/antlr/2.7.7/antlr-2.7.7.jar" -o smali_libs/antlr.jar
 
           mkdir -p build_dex/classes next_dex_smali
           javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java
           jar cf build_dex/classes.jar -C build_dex/classes .
           "$BUILD_TOOLS/d8" --min-api 21 --lib "$PLATFORM_JAR" --output build_dex/ build_dex/classes.jar
-          java -jar baksmali.jar d build_dex/classes.dex -o next_dex_smali
+          java -Xmx2g -cp "smali_libs/*" org.jf.baksmali.Main d build_dex/classes.dex -o next_dex_smali
 
           RELEASE_URL=$(curl -sL "https://api.github.com/repos/${{ github.repository }}/releases" | grep -o 'https://github.com/[^"]*\.apk' | head -n 1 || true)
           if [ -z "$RELEASE_URL" ]; then
@@ -51,7 +60,7 @@ jobs:
           COUNT=0
           for DEX in $(ls apk_work/classes*.dex | sort -V); do
             SMALI_DIR="${DEX}_smali"
-            java -jar baksmali.jar d "$DEX" -o "$SMALI_DIR"
+            java -Xmx2g -cp "smali_libs/*" org.jf.baksmali.Main d "$DEX" -o "$SMALI_DIR"
             MATCHES=$(grep -rl "Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V" "$SMALI_DIR" || true)
             if [ -n "$MATCHES" ]; then
               for FILE in $MATCHES; do
@@ -60,12 +69,12 @@ jobs:
                 COUNT=$((COUNT + 1))
                 mv "$FILE" "next_dex_smali/hooked_${COUNT}.smali"
               done
-              java -jar smali.jar a "$SMALI_DIR" -o "$DEX"
+              java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a "$SMALI_DIR" -o "$DEX"
             fi
             rm -rf "$SMALI_DIR"
           done
 
-          java -jar smali.jar a next_dex_smali -o "apk_work/$NEXT_DEX"
+          java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a next_dex_smali -o "apk_work/$NEXT_DEX"
           (cd apk_work && zip -q -0 -u working.apk classes*.dex)
 
           "$BUILD_TOOLS/zipalign" -p -f 4 apk_work/working.apk YouTube-YTGuard-Integrated.apk
