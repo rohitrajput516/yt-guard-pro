@@ -4,6 +4,10 @@ on:
   push:
     branches: [ "main", "master" ]
   workflow_dispatch:
+    inputs:
+      guard:
+        description: 'Guard inject (true/false)'
+        default: 'true'
 
 jobs:
   build:
@@ -19,13 +23,30 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Compile YTGuardEngine & Build Crash-Proof APK
+      - name: Compile YTGuardEngine & Inject Into YouTube APK
         run: |
           set -e
           PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
+          mkdir -p smali_libs
+          MAVEN="https://repo1.maven.org/maven2"
+          curl -sL "$MAVEN/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar" -o smali_libs/baksmali.jar
+          curl -sL "$MAVEN/org/smali/smali/2.5.2/smali-2.5.2.jar" -o smali_libs/smali.jar
+          curl -sL "$MAVEN/org/smali/dexlib2/2.5.2/dexlib2-2.5.2.jar" -o smali_libs/dexlib2.jar
+          curl -sL "$MAVEN/org/smali/util/2.5.2/util-2.5.2.jar" -o smali_libs/util.jar
+          curl -sL "$MAVEN/com/beust/jcommander/1.78/jcommander-1.78.jar" -o smali_libs/jcommander.jar
+          curl -sL "$MAVEN/com/google/guava/guava/27.1-android/guava-27.1-android.jar" -o smali_libs/guava.jar
+          curl -sL "$MAVEN/org/antlr/antlr-runtime/3.5.2/antlr-runtime-3.5.2.jar" -o smali_libs/antlr-runtime.jar
+          curl -sL "$MAVEN/org/antlr/stringtemplate/3.2.1/stringtemplate-3.2.1.jar" -o smali_libs/stringtemplate.jar
+          curl -sL "$MAVEN/antlr/antlr/2.7.7/antlr-2.7.7.jar" -o smali_libs/antlr.jar
           curl -sL "https://github.com/REAndroid/APKEditor/releases/download/V1.3.9/APKEditor-1.3.9.jar" -o APKEditor.jar
+
+          mkdir -p build_dex/classes next_dex_smali
+          javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java CrashCatcher.java
+          jar cf build_dex/classes.jar -C build_dex/classes .
+          "$BUILD_TOOLS/d8" --min-api 21 --lib "$PLATFORM_JAR" --output build_dex/ build_dex/classes.jar
+          java -Xmx2g -cp "smali_libs/*" org.jf.baksmali.Main d build_dex/classes.dex -o next_dex_smali
 
           RELEASE_URL=$(curl -sL "https://api.github.com/repos/${{ github.repository }}/releases" | grep -o 'https://github.com/[^"]*\.apk' | head -n 1 || true)
           if [ -z "$RELEASE_URL" ]; then
@@ -34,321 +55,78 @@ jobs:
           fi
           curl -sL "$RELEASE_URL" -o raw_base.apk
 
+          echo "Renaming package & provider authorities to avoid system YouTube conflict..."
           java -Xmx3g -jar APKEditor.jar d -t xml -i raw_base.apk -o apk_decoded
 
           python3 - << 'EOF'
-          import os, re, glob, json, struct, hashlib, zlib
+          import re
 
           manifest_path = "apk_decoded/AndroidManifest.xml"
           with open(manifest_path, "r", encoding="utf-8") as f:
               xml_text = f.read()
 
-          pkg_match = re.search(r'package="([^"]+)"', xml_text)
-          orig_pkg = pkg_match.group(1) if pkg_match else "com.google.android.youtube"
-          # 'd' (0x64) < 'e' (0x65): 26-char package name that preserves DEX string_ids sort order
-          new_pkg = "com.google.android.youtubd" if orig_pkg == "com.google.android.youtube" else orig_pkg
+          old_pkg = "com.google.android.youtube"
+          new_pkg = "com.rohitx.android.youtube"
 
-          # 1. Expand all relative class names BEFORE changing manifest package
-          for attr in ["android:name", "android:targetActivity", "android:backupAgent", "android:manageSpaceActivity", "android:parentActivityName"]:
-              xml_text = re.sub(rf'{attr}="\.([^"]+)"', f'{attr}="{orig_pkg}.\\1"', xml_text)
+          xml_text = re.sub(r'android:name="\.([^"]+)"', f'android:name="{old_pkg}.\\1"', xml_text)
+          xml_text = re.sub(r'package="com\.google\.android\.youtube"', f'package="{new_pkg}"', xml_text)
 
-          if orig_pkg != new_pkg:
-              xml_text = re.sub(rf'package="{re.escape(orig_pkg)}"', f'package="{new_pkg}"', xml_text)
-              xml_text = xml_text.replace(f'android:authorities="{orig_pkg}', f'android:authorities="{new_pkg}')
-              xml_text = re.sub(rf'(<permission\b[^>]*android:name="){re.escape(orig_pkg)}([^"]*")', f'\\1{new_pkg}\\2', xml_text)
-              xml_text = re.sub(rf'(<uses-permission\b[^>]*android:name="){re.escape(orig_pkg)}([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+          counter = [0]
+          def fix_authorities(m):
+              val = m.group(1)
+              if old_pkg in val:
+                  return f'android:authorities="{val.replace(old_pkg, new_pkg)}"'
+              elif val.startswith("@"):
+                  counter[0] += 1
+                  return f'android:authorities="{new_pkg}.provider.p{counter[0]}"'
+              else:
+                  return f'android:authorities="{new_pkg}.{val}"'
 
-              for pj_path in glob.glob("apk_decoded/resources/**/package.json", recursive=True):
-                  try:
-                      with open(pj_path, "r", encoding="utf-8") as pf:
-                          pj = json.load(pf)
-                      if pj.get("package_name") == orig_pkg:
-                          pj["package_name"] = new_pkg
-                          with open(pj_path, "w", encoding="utf-8") as pf:
-                              json.dump(pj, pf, indent=2)
-                  except Exception:
-                      pass
-
-              for res_file in glob.glob("apk_decoded/resources/**/*.xml", recursive=True):
-                  try:
-                      with open(res_file, "r", encoding="utf-8", errors="ignore") as rf:
-                          st = rf.read()
-                      if orig_pkg in st:
-                          st = st.replace(orig_pkg, new_pkg)
-                          with open(res_file, "w", encoding="utf-8") as wf:
-                              wf.write(st)
-                  except Exception:
-                      pass
-
-          # 2. Prevent exported/permission conflicts with pre-installed YouTube
-          xml_text = re.sub(r'android:sharedUserId="[^"]+"', '', xml_text)
-          if 'android:extractNativeLibs="' in xml_text:
-              xml_text = re.sub(r'android:extractNativeLibs="[^"]+"', 'android:extractNativeLibs="true"', xml_text)
-          else:
-              xml_text = xml_text.replace("<application ", '<application android:extractNativeLibs="true" ', 1)
-
-          # 3. Inject YTGuardInitProvider with max initOrder
-          provider_tag = (
-              f'\n        <provider android:name="com.rohit.ytguard.YTGuardInitProvider" '
-              f'android:authorities="{new_pkg}.ytguard.initprovider" '
-              f'android:exported="false" android:initOrder="2147483647" />'
-          )
-          xml_text = re.sub(r'(<application\b[^>]*>)', r'\1' + provider_tag, xml_text, count=1)
+          xml_text = re.sub(r'android:authorities="([^"]+)"', fix_authorities, xml_text)
+          xml_text = re.sub(r'(<permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
+          xml_text = re.sub(r'(<uses-permission\b[^>]*android:name=")com\.google\.android\.youtube([^"]*")', f'\\1{new_pkg}\\2', xml_text)
 
           with open(manifest_path, "w", encoding="utf-8") as f:
               f.write(xml_text)
-
-          # 4. Patch classes*.dex: update exact package string & NOP out Process.killProcess / System.exit
-          def read_uleb128(buf, pos):
-              result = 0
-              shift = 0
-              while True:
-                  b = buf[pos]
-                  pos += 1
-                  result |= (b & 0x7f) << shift
-                  if (b & 0x80) == 0:
-                      break
-                  shift += 7
-              return result, pos
-
-          exact_old = b"\x1acom.google.android.youtube\x00"
-          exact_new = b"\x1acom.google.android.youtubd\x00"
-
-          for dex_file in sorted(glob.glob("apk_decoded/root/classes*.dex")):
-              with open(dex_file, "rb") as df:
-                  data = bytearray(df.read())
-
-              modified = False
-              if orig_pkg != new_pkg and exact_old in data:
-                  data = data.replace(exact_old, exact_new)
-                  modified = True
-
-              string_ids_size, string_ids_off = struct.unpack_from("<II", data, 56)
-              type_ids_size, type_ids_off = struct.unpack_from("<II", data, 64)
-              method_ids_size, method_ids_off = struct.unpack_from("<II", data, 88)
-              class_defs_size, class_defs_off = struct.unpack_from("<II", data, 96)
-
-              def get_str(idx):
-                  s_off = struct.unpack_from("<I", data, string_ids_off + idx * 4)[0]
-                  _, p = read_uleb128(data, s_off)
-                  end = data.find(0, p)
-                  return bytes(data[p:end])
-
-              kill_methods = set()
-              for m_idx in range(method_ids_size):
-                  c_idx, p_idx, n_idx = struct.unpack_from("<HHI", data, method_ids_off + m_idx * 8)
-                  t_str_idx = struct.unpack_from("<I", data, type_ids_off + c_idx * 4)[0]
-                  cls_b = get_str(t_str_idx)
-                  if cls_b in (b"Landroid/os/Process;", b"Ljava/lang/System;", b"Ljava/lang/Runtime;"):
-                      name_b = get_str(n_idx)
-                      if (cls_b == b"Landroid/os/Process;" and name_b == b"killProcess") or \
-                         (cls_b == b"Ljava/lang/System;" and name_b == b"exit") or \
-                         (cls_b == b"Ljava/lang/Runtime;" and name_b in (b"exit", b"halt")):
-                          kill_methods.add(m_idx)
-
-              if kill_methods:
-                  for c_idx in range(class_defs_size):
-                      class_data_off = struct.unpack_from("<I", data, class_defs_off + c_idx * 32 + 24)[0]
-                      if class_data_off == 0:
-                          continue
-                      pos = class_data_off
-                      sf_size, pos = read_uleb128(data, pos)
-                      if_size, pos = read_uleb128(data, pos)
-                      dm_size, pos = read_uleb128(data, pos)
-                      vm_size, pos = read_uleb128(data, pos)
-                      for _ in range(sf_size + if_size):
-                          _, pos = read_uleb128(data, pos)
-                          _, pos = read_uleb128(data, pos)
-                      for _ in range(dm_size + vm_size):
-                          _, pos = read_uleb128(data, pos)
-                          _, pos = read_uleb128(data, pos)
-                          code_off, pos = read_uleb128(data, pos)
-                          if code_off != 0:
-                              insns_size = struct.unpack_from("<I", data, code_off + 12)[0]
-                              start = code_off + 16
-                              end = start + insns_size * 2
-                              p = start
-                              while p + 6 <= end:
-                                  op = data[p]
-                                  if op in (0x71, 0x77, 0x6e, 0x74):
-                                      m_ref = struct.unpack_from("<H", data, p + 2)[0]
-                                      if m_ref in kill_methods and data[p+4] == 0 and data[p+5] == 0:
-                                          data[p:p+6] = b"\x00\x00\x00\x00\x00\x00"
-                                          modified = True
-                                          p += 6
-                                          continue
-                                  p += 2
-
-              if modified:
-                  sha1 = hashlib.sha1(data[32:]).digest()
-                  data[12:32] = sha1
-                  adler = zlib.adler32(data[12:]) & 0xffffffff
-                  data[8:12] = struct.pack("<I", adler)
-                  with open(dex_file, "wb") as df:
-                      df.write(data)
           EOF
-
-          mkdir -p gen_src
-          cat << 'EOF' > gen_src/YTGuardInitProvider.java
-          package com.rohit.ytguard;
-
-          import android.app.Activity;
-          import android.app.Application;
-          import android.app.Instrumentation;
-          import android.content.ContentProvider;
-          import android.content.ContentValues;
-          import android.content.Context;
-          import android.content.pm.ProviderInfo;
-          import android.database.Cursor;
-          import android.net.Uri;
-          import android.os.Bundle;
-          import android.os.Looper;
-          import java.lang.reflect.Field;
-          import java.lang.reflect.Method;
-
-          public class YTGuardInitProvider extends ContentProvider {
-
-              private static volatile boolean shieldInstalled = false;
-
-              private static final Thread.UncaughtExceptionHandler CRASH_SHIELD = new Thread.UncaughtExceptionHandler() {
-                  @Override
-                  public void uncaughtException(Thread t, Throwable e) {
-                      Thread main = Looper.getMainLooper().getThread();
-                      if (t == main) {
-                          while (true) {
-                              try {
-                                  Looper.loop();
-                              } catch (Throwable ignored) {
-                              }
-                          }
-                      }
-                      // Background thread exceptions (e.g. GMS signature checks) are safely swallowed
-                  }
-              };
-
-              private static void installShieldAndInstrumentation(Context context) {
-                  Thread.setDefaultUncaughtExceptionHandler(CRASH_SHIELD);
-                  Looper.getMainLooper().getThread().setUncaughtExceptionHandler(CRASH_SHIELD);
-
-                  if (!shieldInstalled) {
-                      shieldInstalled = true;
-                      Thread watchdog = new Thread(new Runnable() {
-                          @Override
-                          public void run() {
-                              while (true) {
-                                  try {
-                                      if (Thread.getDefaultUncaughtExceptionHandler() != CRASH_SHIELD) {
-                                          Thread.setDefaultUncaughtExceptionHandler(CRASH_SHIELD);
-                                      }
-                                      Thread main = Looper.getMainLooper().getThread();
-                                      if (main.getUncaughtExceptionHandler() != CRASH_SHIELD) {
-                                          main.setUncaughtExceptionHandler(CRASH_SHIELD);
-                                      }
-                                      Thread.sleep(15L);
-                                  } catch (Throwable ignored) {
-                                  }
-                              }
-                          }
-                      }, "YTGuard-Shield");
-                      watchdog.setDaemon(true);
-                      watchdog.start();
-                  }
-
-                  try {
-                      Class<?> atClass = Class.forName("android.app.ActivityThread");
-                      Method currentAt = atClass.getMethod("currentActivityThread");
-                      Object at = currentAt.invoke(null);
-                      if (at != null) {
-                          Field instField = atClass.getDeclaredField("mInstrumentation");
-                          instField.setAccessible(true);
-                          Object orig = instField.get(at);
-                          if (orig instanceof Instrumentation && !(orig instanceof SafeInstrumentation)) {
-                              instField.set(at, new SafeInstrumentation((Instrumentation) orig));
-                          }
-                      }
-                  } catch (Throwable ignored) {
-                  }
-
-                  if (context != null) {
-                      YTGuardEngine.initFromContext(context);
-                  }
-              }
-
-              public static class SafeInstrumentation extends Instrumentation {
-                  private final Instrumentation base;
-
-                  public SafeInstrumentation(Instrumentation base) {
-                      this.base = base;
-                  }
-
-                  @Override
-                  public boolean onException(Object obj, Throwable e) {
-                      Thread.setDefaultUncaughtExceptionHandler(CRASH_SHIELD);
-                      return true;
-                  }
-
-                  @Override
-                  public void callApplicationOnCreate(Application app) {
-                      try {
-                          YTGuardEngine.initFromContext(app);
-                          base.callApplicationOnCreate(app);
-                      } catch (Throwable ignored) {
-                      }
-                      Thread.setDefaultUncaughtExceptionHandler(CRASH_SHIELD);
-                  }
-
-                  @Override
-                  public void callActivityOnCreate(Activity activity, Bundle icicle) {
-                      try {
-                          base.callActivityOnCreate(activity, icicle);
-                      } catch (Throwable ignored) {
-                      }
-                      YTGuardEngine.initFromContext(activity);
-                  }
-
-                  @Override
-                  public void callActivityOnResume(Activity activity) {
-                      try {
-                          base.callActivityOnResume(activity);
-                      } catch (Throwable ignored) {
-                      }
-                      YTGuardEngine.initFromContext(activity);
-                  }
-              }
-
-              @Override
-              public void attachInfo(Context context, ProviderInfo info) {
-                  installShieldAndInstrumentation(context);
-                  super.attachInfo(context, info);
-              }
-
-              @Override
-              public boolean onCreate() {
-                  installShieldAndInstrumentation(getContext());
-                  return true;
-              }
-
-              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so) { return null; }
-              @Override public String getType(Uri u) { return null; }
-              @Override public Uri insert(Uri u, ContentValues v) { return null; }
-              @Override public int delete(Uri u, String s, String[] sa) { return 0; }
-              @Override public int update(Uri u, ContentValues v, String s, String[] sa) { return 0; }
-          }
-          EOF
-
-          mkdir -p build_dex/classes
-          javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" -d build_dex/classes YTGuardEngine.java gen_src/*.java
-          jar cf build_dex/classes.jar -C build_dex/classes .
-          "$BUILD_TOOLS/d8" --min-api 21 --lib "$PLATFORM_JAR" --output build_dex/ build_dex/classes.jar
-
-          DEX_COUNT=$(ls apk_decoded/root/classes*.dex | wc -l)
-          NEXT_DEX="classes$((DEX_COUNT + 1)).dex"
-          cp build_dex/classes.dex "apk_decoded/root/$NEXT_DEX"
 
           java -Xmx3g -jar APKEditor.jar b -i apk_decoded -o base.apk
           rm -rf apk_decoded raw_base.apk
 
-          "$BUILD_TOOLS/zipalign" -p -f 4 base.apk YouTube-YTGuard-Integrated.apk
+          mkdir -p apk_work
+          cp base.apk apk_work/working.apk
+          unzip -q apk_work/working.apk "classes*.dex" -d apk_work/
+
+          DEX_COUNT=$(ls apk_work/classes*.dex | wc -l)
+          NEXT_DEX="classes$((DEX_COUNT + 1)).dex"
+
+          COUNT=0
+          if [ "${{ github.event.inputs.guard }}" != "false" ]; then
+          echo "Guard hook ON"
+          for DEX in $(ls apk_work/classes*.dex | sort -V); do
+            SMALI_DIR="${DEX}_smali"
+            java -Xmx2g -cp "smali_libs/*" org.jf.baksmali.Main d "$DEX" -o "$SMALI_DIR"
+            MATCHES=$(grep -rl "Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V" "$SMALI_DIR" || true)
+            if [ -n "$MATCHES" ]; then
+              for FILE in $MATCHES; do
+                sed -i 's|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static {p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
+                sed -i 's|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V|invoke-super/range {p0 .. p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/CrashCatcher;->install(Landroid/content/Context;)V\n    invoke-static/range {p0 .. p0}, Lcom/rohit/ytguard/YTGuardEngine;->initFromContext(Landroid/content/Context;)V|g' "$FILE"
+                COUNT=$((COUNT + 1))
+                mv "$FILE" "next_dex_smali/hooked_${COUNT}.smali"
+              done
+              java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a "$SMALI_DIR" -o "$DEX"
+            fi
+            rm -rf "$SMALI_DIR"
+          done
+          else
+          echo "Guard hook OFF (test build: only package rename)"
+          fi
+
+          java -Xmx2g -cp "smali_libs/*" org.jf.smali.Main a next_dex_smali -o "apk_work/$NEXT_DEX"
+          zip -q -d apk_work/working.apk "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/*.EC" "META-INF/MANIFEST.MF" || true
+          (cd apk_work && zip -q -0 -u working.apk classes*.dex)
+
+          "$BUILD_TOOLS/zipalign" -p -f 4 apk_work/working.apk YouTube-YTGuard-Integrated.apk
           rm -f release.keystore
           keytool -genkey -v -keystore release.keystore -alias ytguard -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=Rohit, OU=Dev, O=YTGuard, L=Dholpur, S=RJ, C=IN"
           "$BUILD_TOOLS/apksigner" sign --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --ks release.keystore --ks-pass pass:123456 --key-pass pass:123456 YouTube-YTGuard-Integrated.apk
