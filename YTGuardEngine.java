@@ -172,7 +172,8 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
 
             JSONObject cfg = loadConfig(activity);
             boolean family = isFamilyMode(cfg);
-            pill.setText(family ? "GUARD • FAMILY" : "GUARD • STRICT");
+            boolean guardOn = cfg.optBoolean("guardEnabled", false);
+            pill.setText(!guardOn ? "GUARD • OFF" : (family ? "GUARD • FAMILY" : "GUARD • STRICT"));
             pill.bringToFront();
         } catch (Throwable ignored) {
         }
@@ -187,6 +188,13 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
 
         JSONObject cfg = loadConfig(activity);
         long now = System.currentTimeMillis();
+
+        // MASTER SWITCH: guard does nothing until the owner turns it ON
+        if (!cfg.optBoolean("guardEnabled", false)) {
+            unverifiedWatchStart = 0L;
+            hideLockShield(activity);
+            return;
+        }
 
         if (isFamilyMode(cfg)) {
             unverifiedWatchStart = 0L;
@@ -204,38 +212,34 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
 
         scanViewTree(decor, texts, ids, shortsLocked, shortsDetected, activity);
 
-        // 1. Block Shorts Inside YouTube
+        // 1. Shorts: show lock screen + ask password (never closes the app)
         if (shortsLocked && shortsDetected[0]) {
-            pauseMediaPlayback(activity);
-            if (now - lastBlockActionTime > 700L) {
-                lastBlockActionTime = now;
-                activity.onBackPressed();
-                Toast.makeText(activity, "YT Guard: Shorts is locked (Password #2)", Toast.LENGTH_SHORT).show();
-            }
+            unverifiedWatchStart = 0L;
+            enforceInAppVideoBlock(activity, "Shorts is locked", "shorts", "shortsUnlockExpiry", 20);
             return;
         }
 
-        // 2. Check Active Video Watch Player
+        // 2. Video page detection: only by the Subscribe button text
         boolean isWatchPlayerOpen = false;
-        for (int i = 0; i < ids.size(); i++) {
-            String id = (String) ids.get(i);
-            if (id.contains("watch_next") || id.contains("player_view")
-                    || id.contains("watch_while") || id.contains("video_metadata")) {
+        for (int i = 0; i < texts.size(); i++) {
+            String t = ((String) texts.get(i)).trim().toLowerCase(Locale.ROOT);
+            if (t.equals("subscribe") || t.equals("subscribed")
+                    || t.startsWith("subscribe to ") || t.startsWith("subscribed to ")
+                    || t.equals("\u0938\u092c\u094d\u0938\u0915\u094d\u0930\u093e\u0907\u092c \u0915\u0930\u0947\u0902")
+                    || t.equals("\u0938\u092c\u094d\u0938\u0915\u094d\u0930\u093e\u0907\u092c \u0915\u093f\u092f\u093e \u0917\u092f\u093e")) {
                 isWatchPlayerOpen = true;
                 break;
             }
         }
-        if (!isWatchPlayerOpen) {
-            for (int i = 0; i < texts.size(); i++) {
-                String t = ((String) texts.get(i)).toLowerCase(Locale.ROOT);
-                if (t.equals("subscribe") || t.equals("subscribed")) {
-                    isWatchPlayerOpen = true;
-                    break;
-                }
-            }
-        }
 
         if (!isWatchPlayerOpen) {
+            unverifiedWatchStart = 0L;
+            hideLockShield(activity);
+            return;
+        }
+
+        // 2A. Password was entered correctly: 15-minute pass is active
+        if (now < cfg.optLong("emergencyPassExpiry", 0L)) {
             unverifiedWatchStart = 0L;
             hideLockShield(activity);
             return;
@@ -247,7 +251,7 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
         }
         String screenText = sb.toString();
 
-        // 2A. Title Keyword Blacklist
+        // 2B. Title Keyword Blacklist
         if (cfg.optBoolean("enforceTitleBlacklist", true)) {
             JSONArray blockedArr = cfg.optJSONArray("blockedTitleKeywords");
             if (blockedArr != null) {
@@ -255,18 +259,12 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
                     String word = blockedArr.optString(i, "").trim().toLowerCase(Locale.ROOT);
                     if (!word.isEmpty() && screenText.contains(word)) {
                         unverifiedWatchStart = 0L;
-                        enforceInAppVideoBlock(activity, "Blocked Title Keyword: \"" + word + "\"");
+                        enforceInAppVideoBlock(activity, "Blocked Title Keyword: \"" + word + "\"",
+                                "interest", "emergencyPassExpiry", 15);
                         return;
                     }
                 }
             }
-        }
-
-        // 2B. 15-Minute Emergency Single-Video Pass
-        if (now < cfg.optLong("emergencyPassExpiry", 0L)) {
-            unverifiedWatchStart = 0L;
-            hideLockShield(activity);
-            return;
         }
 
         // 2C. Channel Whitelist & Interest Filter
@@ -321,7 +319,7 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
                 String reason = !channelOk
                         ? "Channel is not whitelisted in [" + gName + "]"
                         : "Video topic does not match [" + gName + "] interests";
-                enforceInAppVideoBlock(activity, reason);
+                enforceInAppVideoBlock(activity, reason, "interest", "emergencyPassExpiry", 15);
             }
         }
     }
@@ -391,12 +389,16 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
         }
     }
 
-    private void enforceInAppVideoBlock(final Activity activity, String reason) {
+    private String shieldSlot = "";
+
+    private void enforceInAppVideoBlock(Activity activity, String reason, String slotKey,
+                                        String expiryKey, int minutes) {
         pauseMediaPlayback(activity);
-        showLockShield(activity, reason);
+        showLockShield(activity, reason, slotKey, expiryKey, minutes);
     }
 
-    private void showLockShield(final Activity activity, String reason) {
+    private void showLockShield(final Activity activity, final String reason, final String slotKey,
+                                final String expiryKey, final int minutes) {
         try {
             View decor = activity.getWindow().getDecorView();
             if (!(decor instanceof FrameLayout)) return;
@@ -404,11 +406,15 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
 
             View existing = root.findViewWithTag(TAG_SHIELD);
             if (existing != null) {
-                TextView reasonTv = (TextView) existing.findViewWithTag("shield_reason");
-                if (reasonTv != null) reasonTv.setText(reason);
-                existing.bringToFront();
-                return;
+                if (slotKey.equals(shieldSlot)) {
+                    TextView reasonOld = (TextView) existing.findViewWithTag("shield_reason");
+                    if (reasonOld != null) reasonOld.setText(reason);
+                    existing.bringToFront();
+                    return;
+                }
+                root.removeView(existing);
             }
+            shieldSlot = slotKey;
 
             final LinearLayout shield = new LinearLayout(activity);
             shield.setTag(TAG_SHIELD);
@@ -420,14 +426,14 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
             shield.setPadding(dp(activity, 28), dp(activity, 28), dp(activity, 28), dp(activity, 28));
 
             TextView badge = new TextView(activity);
-            badge.setText("YT GUARD • STRICT LOCK");
+            badge.setText("YT GUARD \u2022 LOCKED");
             badge.setTextColor(Color.parseColor("#94A3B8"));
             badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
             badge.setTypeface(Typeface.DEFAULT_BOLD);
             shield.addView(badge);
 
             TextView title = new TextView(activity);
-            title.setText("Playback Restricted");
+            title.setText("Password Required");
             title.setTextColor(Color.WHITE);
             title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f);
             title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -440,24 +446,56 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
             reasonTv.setTextColor(Color.parseColor("#CBD5E1"));
             reasonTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
             reasonTv.setGravity(Gravity.CENTER);
-            reasonTv.setPadding(0, 0, 0, dp(activity, 24));
+            reasonTv.setPadding(0, 0, 0, dp(activity, 12));
             shield.addView(reasonTv);
 
-            Button backBtn = new Button(activity);
-            backBtn.setText("Close Blocked Video");
-            backBtn.setAllCaps(false);
-            backBtn.setTextColor(Color.parseColor("#0F172A"));
-            backBtn.setBackgroundColor(Color.WHITE);
-            backBtn.setOnClickListener(new View.OnClickListener() {
+            final TextView errTv = new TextView(activity);
+            errTv.setTextColor(Color.parseColor("#F87171"));
+            errTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            errTv.setGravity(Gravity.CENTER);
+            errTv.setPadding(0, 0, 0, dp(activity, 12));
+            shield.addView(errTv);
+
+            Button unlockBtn = new Button(activity);
+            unlockBtn.setText("Enter Password to Play");
+            unlockBtn.setAllCaps(false);
+            unlockBtn.setTextColor(Color.parseColor("#0F172A"));
+            unlockBtn.setBackgroundColor(Color.WHITE);
+            unlockBtn.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
-                    unverifiedWatchStart = 0L;
-                    hideLockShield(activity);
-                    pauseMediaPlayback(activity);
-                    activity.onBackPressed();
+                    final EditText input = new EditText(activity);
+                    input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                    input.setHint("Enter Password");
+                    new AlertDialog.Builder(activity)
+                            .setTitle(slotKey.equals("shorts") ? "Unlock Shorts" : "Unlock Video")
+                            .setView(input)
+                            .setNegativeButton("Cancel", null)
+                            .setPositiveButton("Unlock", new DialogInterface.OnClickListener() {
+                                @Override
+                                public void onClick(DialogInterface d, int which) {
+                                    JSONObject cfg2 = loadConfig(activity);
+                                    JSONObject pwds = cfg2.optJSONObject("passwords");
+                                    String expected = pwds != null ? pwds.optString(slotKey, "") : "";
+                                    if (!expected.isEmpty() && input.getText().toString().trim().equals(expected)) {
+                                        try {
+                                            cfg2.put(expiryKey, System.currentTimeMillis() + (minutes * 60 * 1000L));
+                                            saveConfig(activity, cfg2);
+                                        } catch (Throwable ignored) {
+                                        }
+                                        unverifiedWatchStart = 0L;
+                                        hideLockShield(activity);
+                                        Toast.makeText(activity, "Unlocked for " + minutes + " minutes", Toast.LENGTH_SHORT).show();
+                                    } else {
+                                        errTv.setText("Wrong password. Still locked.");
+                                        Toast.makeText(activity, "Wrong password", Toast.LENGTH_SHORT).show();
+                                    }
+                                }
+                            })
+                            .show();
                 }
             });
-            shield.addView(backBtn);
+            shield.addView(unlockBtn);
 
             Button panelBtn = new Button(activity);
             panelBtn.setText("Open YT Guard Controls");
@@ -524,6 +562,7 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
         final boolean familyActive = isFamilyMode(cfg);
         final boolean shortsUnlocked = now < cfg.optLong("shortsUnlockExpiry", 0L);
         final boolean passActive = now < cfg.optLong("emergencyPassExpiry", 0L);
+        final boolean guardOn = cfg.optBoolean("guardEnabled", false);
         final JSONObject activeGroup = getActiveGroup(cfg);
 
         ScrollView scroll = new ScrollView(activity);
@@ -531,6 +570,15 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
         container.setOrientation(LinearLayout.VERTICAL);
         container.setPadding(dp(activity, 20), dp(activity, 16), dp(activity, 20), dp(activity, 12));
         scroll.addView(container);
+
+        addSectionTitle(activity, container, "0. Guard Master Switch");
+        addSubtitle(activity, container, guardOn
+                ? "Status: ON (videos & Shorts are locked)"
+                : "Status: OFF (YouTube works normally)");
+        Button masterBtn = createActionButton(activity, guardOn
+                ? "Turn Guard OFF (Password #1)"
+                : "Turn Guard ON");
+        container.addView(masterBtn);
 
         addSectionTitle(activity, container, "1. Family Mode (Unrestricted YouTube)");
         addSubtitle(activity, container, familyActive
@@ -576,6 +624,32 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
                 .setView(scroll)
                 .setNegativeButton("Close", null)
                 .create();
+
+        masterBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                dialog.dismiss();
+                if (guardOn) {
+                    verifyPassword(activity, cfg, "family", "Turn Guard OFF (Password #1)", new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                cfg.put("guardEnabled", false);
+                                saveConfig(activity, cfg);
+                                hideLockShield(activity);
+                                Toast.makeText(activity, "Guard is OFF", Toast.LENGTH_SHORT).show();
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                } else {
+                    try {
+                        cfg.put("guardEnabled", true);
+                        saveConfig(activity, cfg);
+                        Toast.makeText(activity, "Guard is ON", Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {}
+                }
+            }
+        });
 
         famBtn.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -967,6 +1041,7 @@ public class YTGuardEngine implements Application.ActivityLifecycleCallbacks {
             pwds.put("interest", "5555");
             root.put("passwords", pwds);
 
+            root.put("guardEnabled", false);
             root.put("familyModeExpiry", 0L);
             root.put("shortsUnlockExpiry", 0L);
             root.put("emergencyPassExpiry", 0L);
